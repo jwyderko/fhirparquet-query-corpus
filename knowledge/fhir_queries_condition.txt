@@ -1,0 +1,210 @@
+SUMMARY: all these queries use the `fhir` schema. Use these query patterns for condition-related queries unless the user specifies otherwise.
+
+ONLY use these systems for coding in Condition resources unless the user specifies otherwise:
+- ICD10: 'http://hl7.org/fhir/sid/icd-10-cm'
+- ICD9: 'http://hl7.org/fhir/sid/icd-9-cm'
+- SNOMED: 'http://snomed.info/sct'
+
+DO NOT use these columns in thie fhir.condition table unless the user specifies otherwise:
+- fhir.condition.verificationStatus
+
+-- Query FHIR Condition table using SUPER type to unnest coding arrays
+```sql
+SELECT c.id, c.onsetdatetime, c.recordeddate,
+    condition_code.code::varchar AS code,
+    condition_code.display::varchar AS display,
+    condition_code."system"::varchar AS "system",
+    condition_code.userSelected::varchar AS userSelected
+FROM fhir.condition c
+    JOIN c.code.coding AS condition_code ON true;
+```
+
+Prompt: Create a histogram of ICD9 and 10 codes used in conditions
+```sql
+select
+	x.code::varchar,
+	x."system"::varchar,
+	count(1)
+from fhir.condition c, c.code.coding x
+where x.system::varchar in ('http://hl7.org/fhir/sid/icd-10-cm','http://hl7.org/fhir/sid/icd-9-cm')
+group by 1,2
+```
+
+The following concepts are stored in `fhir.condition.extension[x].extension` array with `fhir.condition.extension` = 'http://careevolution.com/fhirextensions#properties'. 
+Use these query patterns unless the user specifies otherwise.
+DO NOT look up urls; use the urls below; determine values ONLY as described below:
+- extension.url::varchar = 'affectsDRG', valueBoolean
+- extension.url::varchar = 'affectsROM', valueBoolean
+- extension.url::varchar = 'affectsSOI', valueBoolean
+- extension.url::varchar = 'comorbidity', valueString
+- extension.url::varchar = 'hostModule', valueString
+- extension.url::varchar = 'isChronic', valueBoolean
+- extension.url::varchar = 'isComorbidity', valueBoolean
+- extension.url::varchar = 'isEmergency', valueBoolean
+- extension.url::varchar = 'isPrimary', valueBoolean
+- extension.url::varchar = 'presentOnAdmission', valueString
+- extension.url::varchar = 'priority', valueString
+- extension.url::varchar = 'riskOfMortality', valueString
+- extension.url::varchar = 'severityOfIllness', valueString
+
+
+example query include an extension concept (in this case, "isChronic") for a Condition resource:
+
+```
+with patient_list as (
+select
+    person_uuid
+from fhir.patient
+limit 100
+)
+select
+    p.person_uuid,
+    c.id as condition_id,
+    e_ext.valueBoolean as is_chronic
+from fhir.condition c
+    LEFT JOIN c.extension e on true
+    LEFT JOIN e.extension e_ext on true
+    JOIN patient_list p on p.person_uuid = c.person_uuid
+where
+    e.url = 'http://careevolution.com/fhirextensions#properties'
+    and e_ext.url = 'isChronic'
+```
+
+example query to get all extension concepts for a set of Condition resources:
+```
+with patient_list as (
+select
+    person_uuid
+from fhir.patient
+limit 100
+)
+select
+    p.person_uuid,
+    c.id as condition_id,
+    e_ext.url::varchar as extension_url,
+    e_ext.valueboolean::boolean,
+    e_ext.valuestring::varchar
+from fhir.condition c
+    LEFT JOIN c.extension e on true
+    LEFT JOIN e.extension e_ext on true
+    JOIN patient_list p on p.person_uuid = c.person_uuid
+where
+    e.url = 'http://careevolution.com/fhirextensions#properties'
+```
+
+
+-- Example queries for different Condition categories
+"Problem list" Conditions are defined as Condition resources with 
+category.coding.system = 'http://terminology.hl7.org/CodeSystem/condition-category' and category.coding.code = 'problem-list-item'.
+
+Examples:
+
+```sql
+-- Unique "Problem list" Conditions (FHIR) for a list of MRNs, restricted to ICD-10-CM codes
+-- Replace :MRN_LIST with a list of the MRN values you want
+WITH patient_mrn AS (
+    SELECT DISTINCT
+        pt.person_uuid,
+        ident.value::varchar AS mrn
+    FROM fhir.patient pt
+         JOIN pt.identifier AS ident ON true
+         JOIN ident.type.coding AS idtype_coding ON true
+    WHERE idtype_coding.code::varchar = 'MR'
+      AND idtype_coding."system"::varchar = 'http://terminology.hl7.org/CodeSystem/v2-0203'
+      AND ident.value::varchar in (:MRN_LIST)
+),
+condition_icd10_problem AS (
+    SELECT
+        c.person_uuid,
+        c.id AS condition_id,
+        c.onsetDateTime,
+        c.recordedDate,
+        code_coding.code::varchar AS icd10_code,
+        coalesce(code_coding.display::varchar, c.code.text::varchar) AS icd10_display,
+        clinicalStatus_coding.code::varchar AS clinicalStatus_coding_code
+    FROM fhir.condition c
+         JOIN c.category AS category ON true
+         JOIN category.coding AS category_coding ON true
+         JOIN c.code.coding AS code_coding ON true
+         JOIN c.clinicalStatus.coding as clinicalStatus_coding ON true
+    WHERE c.person_uuid in (select person_uuid from patient_mrn)
+      AND category_coding."system"::varchar = 'http://terminology.hl7.org/CodeSystem/condition-category'
+      AND category_coding.code::varchar = 'problem-list-item'
+      AND code_coding."system"::varchar = 'http://hl7.org/fhir/sid/icd-10-cm'
+      AND clinicalStatus_coding."system"::varchar = 'http://terminology.hl7.org/CodeSystem/condition-clinical'
+)
+SELECT 
+	mrn,
+	icd10_code,
+	icd10_display,
+	clinicalStatus_coding_code,
+	min(onsetDateTime) as onset_date_time,
+	min(recordedDate) as first_recorded_date,
+	max(recordedDate) as last_recorded_date
+FROM 
+	patient_mrn
+	JOIN condition_icd10_problem cip on patient_mrn.person_uuid = cip.person_uuid
+GROUP BY
+	mrn,
+	icd10_code,
+	icd10_display,
+	clinicalStatus_coding_code
+order by
+	mrn,
+	onset_date_time
+```
+
+"Encounter Diagnoses" are defined as Condition resources with
+category.coding.system = 'http://terminology.hl7.org/CodeSystem/condition-category' and category.coding.code = 'encounter-diagnosis'.
+
+
+
+"Medical History" Conditions are defined as Condition resources with category.coding.code = 'medical-history'. (DO NOT USE SYSTEM)
+
+```sql
+-- Unique "Medical History" Conditions (FHIR) for a list of MRNs, restricted to ICD-10-CM codes
+-- Medical History Conditions do not have onsetDateTime or clinicalStatus; do not include these columns in the query
+-- Replace :MRN_LIST with a list of the MRN values you want
+WITH patient_mrn AS (
+    SELECT DISTINCT
+        pt.person_uuid,
+        ident.value::varchar AS mrn
+    FROM fhir.patient pt
+    	JOIN pt.identifier AS ident ON true
+        JOIN ident.type.coding AS idtype_coding ON true
+    WHERE idtype_coding.code::varchar = 'MR'
+      AND idtype_coding."system"::varchar = 'http://terminology.hl7.org/CodeSystem/v2-0203'
+      AND ident.value::varchar in (:MRN_LIST)
+),
+condition_icd10_problem AS (
+    SELECT
+        c.person_uuid,
+        c.id AS condition_id,
+        c.recordedDate,
+        code_coding.code::varchar AS icd10_code,
+        coalesce(code_coding.display::varchar, c.code.text::varchar) AS icd10_display
+    FROM fhir.condition c
+        LEFT JOIN c.category AS category ON true
+        LEFT JOIN category.coding AS category_coding ON true
+        LEFT JOIN c.code.coding AS code_coding ON true
+    WHERE c.person_uuid in (select person_uuid from patient_mrn)
+      AND category_coding.code::varchar = 'medical-history'
+      AND code_coding."system"::varchar = 'http://hl7.org/fhir/sid/icd-10-cm'
+)
+SELECT 
+	mrn,
+	icd10_code,
+	icd10_display,
+	min(recordedDate) as first_recorded_date,
+	max(recordedDate) as last_recorded_date
+FROM 
+	patient_mrn
+	JOIN condition_icd10_problem cip ON patient_mrn.person_uuid = cip.person_uuid
+GROUP BY
+	mrn,
+	icd10_code,
+	icd10_display
+ORDER BY
+	mrn,
+	first_recorded_date
+```

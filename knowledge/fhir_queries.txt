@@ -1,0 +1,519 @@
+SUMMARY: all these queries use the `fhir` schema.
+
+Prompt:top 10 mrns with the most encounter of type hospitalization in 2025
+```sql
+SELECT
+  patient_identifier.value::varchar AS mrn,
+  COUNT(DISTINCT enc.id) AS hospitalization_count
+FROM fhir.patient pt
+  JOIN pt.identifier AS patient_identifier ON TRUE
+  JOIN patient_identifier.type.coding AS patient_identifier_type_coding ON TRUE
+  JOIN fhir.encounter enc on enc.person_uuid = pt.person_uuid
+WHERE patient_identifier_type_coding.code::varchar = 'MR'
+  AND patient_identifier_type_coding."system"::varchar = 'http://terminology.hl7.org/CodeSystem/v2-0203'
+  AND enc.class."system"::varchar = 'http://terminology.hl7.org/CodeSystem/v3-ActCode'
+  AND enc.class.code::varchar = 'IMP'   -- inpatient hospitalization
+  AND enc.period.start::date >= '2025-01-01'::date
+  AND enc.period.start::date < '2026-01-01'::date
+GROUP BY mrn
+ORDER BY hospitalization_count DESC
+LIMIT 100;
+```
+
+Prompt:
+Find all office visits for a patient with specified mrn that occur in 2025
+```sql
+-- replace :MRN with the actual MRN value in single quotes when executing
+SELECT 
+  enc.person_uuid,
+  enc.id AS encounter_id,
+  enc.status,
+  enc.class.code::varchar AS class_code,
+  enc.period.start::timestamptz AS period_start,
+  enc.period."end"::timestamptz AS period_end
+FROM fhir.patient pt
+  JOIN pt.identifier AS patient_identifier ON TRUE
+  JOIN patient_identifier.type.coding AS patient_identifier_type_coding ON TRUE
+  JOIN fhir.encounter enc on enc.person_uuid = pt.person_uuid
+WHERE
+  patient_identifier_type_coding.code::varchar = 'MR'
+  AND patient_identifier_type_coding."system"::varchar = 'http://terminology.hl7.org/CodeSystem/v2-0203'
+  AND patient_identifier.value::varchar = :MRN
+  AND enc.class."system"::varchar = 'http://terminology.hl7.org/CodeSystem/v3-ActCode'
+  AND enc.class.code::varchar = 'AMB'
+  AND enc.period.start::date >= '2025-01-01'::date
+  AND enc.period.start::date < '2026-01-01'::date
+LIMIT 100;
+```
+
+Prompt: Find all hospitalizations for a patient with a specific MRN that occur in 2025 with the top 3 diagnoses for the hospitalization. One row per hospitalization; each diagnosis in a separate column.
+
+Query: option 1
+```
+-- replace :MRN with the actual MRN value in single quotes when executing
+WITH patient_mrn AS (
+  SELECT 
+    pt.person_uuid
+  FROM fhir.patient pt
+    JOIN pt.identifier AS patient_identifier ON true
+    JOIN patient_identifier.type.coding AS patient_identifier_coding ON true
+  WHERE patient_identifier_coding.code::varchar = 'MR'
+    AND patient_identifier_coding."system"::varchar = 'http://terminology.hl7.org/CodeSystem/v2-0203'
+    AND patient_identifier.value::varchar = :MRN
+),
+enc_hosp AS (
+SELECT
+enc.person_uuid,
+enc.id as encounter_id,
+enc.reference_id AS encounter_reference_id,
+enc.status,
+enc.class.code::varchar AS class_code,
+enc.period.start::timestamptz AS period_start,
+enc.period."end"::timestamptz AS period_end
+FROM fhir.encounter enc
+JOIN patient_mrn p ON p.person_uuid = enc.person_uuid
+WHERE enc."class"."system"::varchar = 'http://terminology.hl7.org/CodeSystem/v3-ActCode'
+AND enc."class".code::varchar = 'IMP'
+AND enc.period."start"::date >= '2025-01-01'::date
+AND enc.period."start"::date < '2026-01-01'::date
+),
+diag_ranked AS (
+SELECT
+e.person_uuid,
+e.encounter_id,
+e.encounter_reference_id,
+diag.rank::int AS dx_rank,
+diag.condition.reference::varchar AS condition_reference_id
+FROM enc_hosp e,
+fhir.encounter enc2,
+enc2.diagnosis AS diag
+WHERE enc2.person_uuid = e.person_uuid
+),
+condition_best_code AS (
+SELECT
+c.person_uuid,
+c.reference_id AS condition_reference_id,
+coding.code::varchar AS code,
+coding.display::varchar AS display,
+coding."system"::varchar AS "system",
+ROW_NUMBER() OVER (
+PARTITION BY c.person_uuid, c.id
+ORDER BY CASE WHEN coding."system"::varchar = 'http://snomed.info/sct' THEN 1 ELSE 2 END,
+coding.code::varchar
+) AS rn
+FROM patient_mrn p,
+fhir.condition c,
+c.code.coding AS coding
+where c.person_uuid = p.person_uuid
+)
+SELECT
+e.person_uuid,
+e.encounter_id,
+e.period_start,
+e.period_end,
+MAX(CASE WHEN d.dx_rank = 1 THEN cb.code END)::varchar AS diagnosis1_code,
+MAX(CASE WHEN d.dx_rank = 1 THEN cb.display END)::varchar AS diagnosis1_display,
+MAX(CASE WHEN d.dx_rank = 2 THEN cb.code END)::varchar AS diagnosis2_code,
+MAX(CASE WHEN d.dx_rank = 2 THEN cb.display END)::varchar AS diagnosis2_display,
+MAX(CASE WHEN d.dx_rank = 3 THEN cb.code END)::varchar AS diagnosis3_code,
+MAX(CASE WHEN d.dx_rank = 3 THEN cb.display END)::varchar AS diagnosis3_display
+FROM enc_hosp e
+LEFT JOIN diag_ranked d
+ON d.person_uuid = e.person_uuid
+AND d.encounter_id = e.encounter_id
+AND d.dx_rank BETWEEN 1 AND 3
+LEFT JOIN condition_best_code cb
+ON cb.person_uuid = d.person_uuid
+AND cb.condition_reference_id = d.condition_reference_id
+AND cb.rn = 1
+GROUP BY e.person_uuid, e.encounter_id, e.period_start, e.period_end
+ORDER BY e.period_start
+LIMIT 100;
+```
+
+Query option 2
+```
+-- replace :MRN with the actual MRN value in single quotes when executing
+WITH patient_mrn AS (
+  SELECT 
+    pt.person_uuid
+  FROM fhir.patient pt
+    JOIN pt.identifier AS patient_identifier ON true
+    JOIN patient_identifier.type.coding AS patient_identifier_coding ON true
+  WHERE patient_identifier_coding.code::varchar = 'MR'
+    AND patient_identifier_coding."system"::varchar = 'http://terminology.hl7.org/CodeSystem/v2-0203'
+    AND patient_identifier.value::varchar = :MRN
+),
+enc_hosp AS (
+SELECT
+enc.person_uuid,
+enc.id as encounter_id,
+enc.reference_id AS encounter_reference_id,
+enc.status,
+enc.class.code::varchar AS class_code,
+enc.period.start::timestamptz AS period_start,
+enc.period."end"::timestamptz AS period_end
+FROM fhir.encounter enc
+JOIN patient_mrn p ON p.person_uuid = enc.person_uuid
+WHERE enc."class"."system"::varchar = 'http://terminology.hl7.org/CodeSystem/v3-ActCode'
+AND enc."class".code::varchar = 'IMP'
+AND enc.period."start"::date >= '2025-01-01'::date
+AND enc.period."start"::date < '2026-01-01'::date
+),
+conds_for_enc AS (
+SELECT DISTINCT
+c.person_uuid,
+c.encounter.reference::varchar AS encounter_reference_id,
+c.id AS condition_id,
+c.reference_id AS condition_reference_id
+FROM fhir.condition c
+JOIN enc_hosp e
+ON e.person_uuid = c.person_uuid
+AND c.encounter.reference::varchar = e.encounter_reference_id
+),
+diag_ranked AS (
+SELECT
+e.person_uuid,
+e.encounter_reference_id,
+diag.rank::int AS dx_rank,
+diag.condition.reference::varchar AS condition_reference_id
+FROM enc_hosp e,
+fhir.encounter enc2,
+enc2.diagnosis AS diag
+WHERE enc2.person_uuid = e.person_uuid
+AND enc2.reference_id = e.encounter_reference_id
+),
+condition_best_code AS (
+SELECT
+c.person_uuid,
+c.id AS condition_id,
+coding.code::varchar AS code,
+coding.display::varchar AS display,
+coding."system"::varchar AS "system",
+ROW_NUMBER() OVER (
+PARTITION BY c.person_uuid, c.id
+ORDER BY CASE WHEN coding."system"::varchar = 'http://snomed.info/sct' THEN 1 ELSE 2 END,
+coding.code::varchar
+) AS rn
+FROM person_mrn p,
+fhir.condition c,
+c.code.coding AS coding
+where c.person_uuid = p.person_uuid
+)
+SELECT
+e.person_uuid,
+e.encounter_reference_id,
+e.period_start,
+e.period_end,
+MAX(CASE WHEN d.dx_rank = 1 THEN cb.code END)::varchar AS diagnosis1_code,
+MAX(CASE WHEN d.dx_rank = 1 THEN cb.display END)::varchar AS diagnosis1_display,
+MAX(CASE WHEN d.dx_rank = 2 THEN cb.code END)::varchar AS diagnosis2_code,
+MAX(CASE WHEN d.dx_rank = 2 THEN cb.display END)::varchar AS diagnosis2_display,
+MAX(CASE WHEN d.dx_rank = 3 THEN cb.code END)::varchar AS diagnosis3_code,
+MAX(CASE WHEN d.dx_rank = 3 THEN cb.display END)::varchar AS diagnosis3_display
+FROM enc_hosp e
+LEFT JOIN conds_for_enc cfe
+ON cfe.person_uuid = e.person_uuid
+AND cfe.encounter_reference_id = e.encounter_reference_id
+LEFT JOIN diag_ranked d
+ON d.person_uuid = e.person_uuid
+AND d.encounter_reference_id = e.encounter_reference_id
+AND d.condition_reference_id = cfe.condition_reference_id
+AND d.dx_rank BETWEEN 1 AND 3
+LEFT JOIN condition_best_code cb
+ON cb.person_uuid = cfe.person_uuid
+AND cb.condition_reference_id = cfe.condition_reference_id
+AND cb.rn = 1
+GROUP BY e.person_uuid, e.encounter_reference_id, e.period_start, e.period_end
+ORDER BY e.period_start
+LIMIT 100;
+```
+
+Prompt: Find all patients (include their first name, last name, gender, dob and mrn) that had an emergency department visit related to asthma in calendar year january 2024.
+```sql
+-- Patients with ED encounters related to asthma in January 2024 (FHIR)
+-- Filters:
+--   * ED visits via Encounter.class.code = 'EMER'
+--   * Date window overlaps 2024-01-01 .. 2024-01-31
+--   * Asthma via Condition.code.coding (ICD-10-CM J45* or SNOMED 195967001)
+-- Conventions:
+--   * Use person_uuid in joins
+--   * Unnest SUPER arrays via FROM comma syntax
+--   * Limit results to 100
+
+WITH ed_encounters AS (
+  SELECT
+      enc.person_uuid,
+      enc.id::varchar                                        AS encounter_id,
+      enc.period.start::timestamp                            AS start_ts,
+      enc.period."end"::timestamp                            AS end_ts
+  FROM fhir.encounter enc
+  WHERE enc."class".code::varchar = 'EMER'
+    AND enc.person_uuid IS NOT NULL
+    -- overlap with Jan 2024
+    AND enc.period.start::timestamp < TIMESTAMP '2024-02-01'
+    AND COALESCE(enc.period."end"::timestamp, enc.period.start::timestamp) >= TIMESTAMP '2024-01-01'
+),
+asthma_conditions AS (
+  SELECT
+      cond.person_uuid,
+      SPLIT_PART(cond.encounter.reference::varchar, '/', 2)        AS encounter_id,
+      ccode.code::varchar                                    AS dx_code,
+      ccode."system"::varchar                                AS dx_system
+  FROM fhir."condition" cond,
+       cond.code.coding AS ccode
+WHERE cond.person_uuid IS NOT NULL
+    AND (
+          ccode.code::varchar ILIKE 'J45%'         -- ICD-10-CM asthma
+       OR  ccode.code::varchar = '195967001'       -- SNOMED CT: Asthma
+    )
+),
+patient_name AS (
+  SELECT
+      pt.person_uuid,
+      name.family::varchar               AS last_name,
+      name.given[0]::varchar             AS first_name,
+      pt.gender::varchar                 AS gender,
+      pt.birthDate::date                 AS dob,
+      ROW_NUMBER() OVER (
+        PARTITION BY pt.person_uuid
+        ORDER BY
+          CASE WHEN name.use::varchar = 'official' THEN 0 ELSE 1 END,
+          name.period.start::timestamp DESC NULLS LAST
+      ) AS rn
+  FROM fhir.patient pt,
+       pt.name  AS name
+  WHERE pt.person_uuid IS NOT NULL
+),
+patient_mrn AS (
+  SELECT
+      pt.person_uuid,
+      ident.value::varchar               AS mrn,
+      ROW_NUMBER() OVER (
+        PARTITION BY pt.person_uuid
+        ORDER BY
+          CASE
+            WHEN idcoding.code::varchar = 'MR' THEN 0
+            WHEN ident."system"::varchar ILIKE '%mrn%' THEN 1
+            ELSE 2
+          END
+      ) AS rn
+  FROM fhir.patient pt,
+       pt.identifier       AS ident,
+       ident.type.coding   AS idcoding
+  WHERE pt.person_uuid IS NOT NULL
+),
+best_name AS (
+  SELECT person_uuid, first_name, last_name, gender, dob
+  FROM patient_name
+  WHERE rn = 1
+),
+best_mrn AS (
+  SELECT person_uuid, mrn
+  FROM patient_mrn
+  WHERE rn = 1
+)
+SELECT DISTINCT
+    bn.first_name,
+    bn.last_name,
+    bn.gender,
+    bn.dob,
+    bm.mrn
+FROM ed_encounters ee
+JOIN asthma_conditions ac
+  ON ac.person_uuid = ee.person_uuid
+ AND ac.encounter_id = ee.encounter_id
+JOIN best_name bn
+  ON bn.person_uuid = ee.person_uuid
+LEFT JOIN best_mrn bm
+  ON bm.person_uuid = ee.person_uuid
+LIMIT 100;
+```
+
+Prompt: Find all patients (include mrn, visit date, and the name of the dx) that had an emergency department visit related to covid in calendar year january 2025.
+
+Query:
+```sql
+-- Patients with ED encounters related to COVID in January 2025 (FHIR, Condition.encounter path)
+-- OUTPUT: mrn, visit_date, diagnosis_name
+-- Window: overlap with 2025-01-01 .. 2025-01-31
+-- ED definition: Encounter.class.code = 'EMER' (ActCode)
+-- MRN definition: Patient.identifier.type.coding code = 'MR' (v2-0203)
+-- Codes: BROAD COVID set (PLEASE VERIFY this list before running in production)
+--   ICD-10-CM: U07.1 (COVID-19), J12.82 (Pneumonia due to COVID-19), M35.81 (MIS), U09.9 (Post COVID-19),
+--              Z20.822 (Exposure), Z11.52 (Screening), Z86.16 (Personal history)
+--   SNOMED CT: 840539006 (COVID-19), 840544004 (Suspected COVID-19), 840546002 (Exposure to SARS-CoV-2),
+--              1119303003 (Post-COVID-19 condition)
+
+WITH covid_codes AS (
+  SELECT 'http://hl7.org/fhir/sid/icd-10-cm'::varchar AS "system", 'U07.1'::varchar AS code, 'COVID-19'::varchar AS display UNION ALL
+  SELECT 'http://hl7.org/fhir/sid/icd-10-cm', 'J12.82', 'Pneumonia due to COVID-19' UNION ALL
+  SELECT 'http://hl7.org/fhir/sid/icd-10-cm', 'M35.81', 'Multisystem inflammatory syndrome (MIS)' UNION ALL
+  SELECT 'http://hl7.org/fhir/sid/icd-10-cm', 'U09.9', 'Post COVID-19 condition, unspecified' UNION ALL
+  SELECT 'http://hl7.org/fhir/sid/icd-10-cm', 'Z20.822', 'Contact with and (suspected) exposure to COVID-19' UNION ALL
+  SELECT 'http://hl7.org/fhir/sid/icd-10-cm', 'Z11.52', 'Encounter for screening for COVID-19' UNION ALL
+  SELECT 'http://hl7.org/fhir/sid/icd-10-cm', 'Z86.16', 'Personal history of COVID-19' UNION ALL
+  SELECT 'http://snomed.info/sct', '840539006', 'COVID-19' UNION ALL
+  SELECT 'http://snomed.info/sct', '840544004', 'Suspected COVID-19' UNION ALL
+  SELECT 'http://snomed.info/sct', '840546002', 'Exposure to SARS-CoV-2' UNION ALL
+  SELECT 'http://snomed.info/sct', '1119303003', 'Post-COVID-19 condition'
+),
+ed_encounters AS (
+  SELECT
+      enc.person_uuid,
+      enc.id::varchar                          AS encounter_id,
+      enc.period.start::timestamp              AS start_ts,
+      enc.period."end"::timestamp              AS end_ts
+  FROM fhir.encounter enc
+  WHERE enc.person_uuid IS NOT NULL
+    AND enc."class"."system"::varchar = 'http://terminology.hl7.org/CodeSystem/v3-ActCode'
+    AND enc."class".code::varchar = 'EMER'
+    -- overlap with Jan 2025
+    AND enc.period.start::timestamp < TIMESTAMP '2025-02-01'
+    AND COALESCE(enc.period."end"::timestamp, enc.period.start::timestamp) >= TIMESTAMP '2025-01-01'
+),
+covid_conditions AS (
+  SELECT
+      cond.person_uuid,
+      SPLIT_PART(cond.encounter.reference::varchar, '/', 2) AS encounter_id,
+      cond.id::varchar                                      AS condition_id,
+      ccode.code::varchar                                   AS dx_code,
+      coalesce(ccode.display::varchar, ccode.code::varchar) AS dx_display,
+      ccode."system"::varchar                               AS dx_system,
+      ROW_NUMBER() OVER (
+        PARTITION BY cond.person_uuid, cond.encounter.reference::varchar, cond.id
+        ORDER BY CASE
+                   WHEN ccode."system"::varchar = 'http://snomed.info/sct' THEN 1
+                   WHEN ccode."system"::varchar = 'http://hl7.org/fhir/sid/icd-10-cm' THEN 2
+                   ELSE 3
+                 END,
+                 ccode.display::varchar
+      ) AS rn
+  FROM fhir.condition cond,
+       cond.code.coding AS ccode,
+       covid_codes cc
+  WHERE cond.person_uuid IS NOT NULL
+    AND cc.code = ccode.code::varchar
+),
+best_covid_condition AS (
+  SELECT
+      person_uuid,
+      encounter_id,
+      dx_display
+  FROM covid_conditions
+  WHERE rn = 1
+),
+patient_mrn AS (
+  SELECT
+      pt.person_uuid,
+      ident.value::varchar AS mrn,
+      ROW_NUMBER() OVER (
+        PARTITION BY pt.person_uuid
+        ORDER BY ident."system"::varchar
+      ) AS rn
+  FROM fhir.patient pt
+    JOIN pt.identifier     AS ident ON true
+    JOIN ident.type.coding AS idcoding ON true
+  WHERE idcoding.code::varchar = 'MR'
+    AND idcoding."system"::varchar = 'http://terminology.hl7.org/CodeSystem/v2-0203'
+),
+best_mrn AS (
+  SELECT person_uuid, mrn
+  FROM patient_mrn
+  WHERE rn = 1
+)
+SELECT DISTINCT
+  bm.mrn::varchar                    AS mrn,
+  ee.start_ts::date                  AS visit_date,
+  bcc.dx_display::varchar            AS diagnosis_name
+FROM ed_encounters ee
+JOIN best_covid_condition bcc
+  ON bcc.person_uuid = ee.person_uuid
+ AND bcc.encounter_id = ee.encounter_id
+LEFT JOIN best_mrn bm
+  ON bm.person_uuid = ee.person_uuid
+ORDER BY visit_date, mrn
+LIMIT 100;
+```
+
+Prompt: Decode text in Binary resources
+```sql
+select cast(to_varbyte(data, 'base64') as varchar(max)) as note_text 
+from fhir.binary
+limit 100;
+```
+
+Prompt: Access narrative reports from DiagnosticReport and Binary resources
+```sql
+SELECT 
+  categorycoding.code::varchar as categorycode,
+  content.url::varchar as binary_reference,
+  bin.contenttype::varchar,
+  cast(to_varbyte(data, 'base64') as varchar(max)) as report, -- Need to decode Base64
+  dr.id, 
+  dr.effectivedatetime, 
+  dr.conclusion
+FROM fhir.diagnosticreport dr
+  JOIN dr.category as category ON true
+  JOIN category.coding as categorycoding ON true
+  JOIN dr.presentedform as content ON true
+  JOIN fhir."binary" bin on bin.person_uuid = dr.person_uuid AND content.url::varchar = bin.reference_id
+LIMIT 100;
+```
+
+Prompt: Find OB-related observations for deliveries in 2025, including details of the delivery observations
+```sql
+with delivery_summary as (
+select
+	o.person_uuid,
+	o.id,
+	eoc.id as episode_of_care_id,
+	o.code.coding[0].display::varchar as finding_type,
+	eoc.type[0].text::varchar as episode_type,
+	o.encounter.reference::varchar as encounter,
+	o.effectivedatetime,
+	o.performer[0].reference::varchar as performer,
+	o.hasmember
+from
+	fhir.observation o
+	join fhir.episodeofcare eoc on eoc.person_uuid = o.person_uuid
+		and eoc.reference_id = o.focus[0].reference::varchar
+where
+	(
+		code.coding[0].code = '118185001' -- "Pregnacy Finding" -
+			or
+		code.coding[0].code = '118215003' -- "Delivery Finding" - (for mom or baby, related to mom)
+	)
+	and effectivedatetime > cast('2025-01-01' as date)
+limit 100
+)
+select
+	summary.person_uuid,
+	summary.id,
+	summary.episode_of_care_id,
+	summary.finding_type,
+	summary.episode_type,
+	summary.encounter, -- optional join to Encounter
+	summary.effectivedatetime,
+	summary.performer, --optional join to Practitioner
+	delivery_detail.id,
+	delivery_detail.code.text::varchar as text,
+	delivery_detail.code.coding[0].code::varchar as code,
+	delivery_detail.code.coding[0].display::varchar as display,
+	delivery_detail.code.coding[0]."system"::varchar as sys,
+	coalesce(delivery_detail.valuestring, delivery_detail.valuedatetime::varchar, delivery_detail.valuequantity.value::varchar) as value,
+	delivery_detail.valuequantity.units as units
+from
+	delivery_summary summary,
+	summary.hasmember detail,
+	fhir.observation as delivery_detail
+where
+	delivery_detail.person_uuid = summary.person_uuid
+	and delivery_detail.reference_id = detail.reference::varchar
+order by
+	summary.id,
+	delivery_detail.id
+limit 1000
+```
+
+

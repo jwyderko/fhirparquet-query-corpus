@@ -1,0 +1,236 @@
+SUMMARY: all these queries use the `fhir` schema. Use these query patterns for encounter-related queries unless the user specifies otherwise.
+
+For any queries related to "primary diagnosis (primary dx)" or "discharge diagnosis (discharge dx)" use the following approach unless the user specifies otherwise:
+
+A primary diagnosis is defined as a Condition resource with extension.url = `http://careevolution.com/fhirextensions#properties` and extension.extension[0].url = `isPrimary` and extension.extension[0].valueBoolean = true.
+
+``` sql
+/* CE CDM Query Copilot
+   Retrieve the PRIMARY diagnosis per Encounter (FHIR)
+   Schema: fhir
+*/
+
+WITH enc AS (
+  SELECT
+      e.person_uuid,
+      e.id::varchar AS encounter_id,
+      e.identifier[0].value::varchar AS encounter_identifier,
+      e.period.start::timestamptz AS admit_datetime,
+      e.period."end"::timestamptz AS discharge_datetime,
+      e.diagnosis AS encounter_diagnosis
+  FROM fhir.encounter e
+  LIMIT 1000
+),
+enc_dx AS (
+  /* Unnest Encounter.diagnosis array */
+  SELECT
+      e.person_uuid,
+      e.encounter_id,
+      e.encounter_identifier,
+      e.admit_datetime,
+      e.discharge_datetime,
+      dx.condition.reference::varchar AS condition_reference,
+      dx.rank AS dx_rank
+  FROM enc e
+     LEFT JOIN e.encounter_diagnosis dx ON TRUE
+),
+primary_dx AS (
+  /* Filter only those diagnoses flagged as primary */
+  SELECT
+      enc_dx.person_uuid,
+      enc_dx.encounter_id,
+      enc_dx.encounter_identifier,
+      enc_dx.admit_datetime,
+      enc_dx.discharge_datetime,
+      c.code condition_code
+  FROM fhir.condition c
+      LEFT JOIN c.extension condition_extension ON TRUE
+      JOIN enc_dx ON enc_dx.condition_reference = c.reference_id
+  WHERE condition_extension.url = 'http://careevolution.com/fhirextensions#properties'
+      AND condition_extension.extension[0].url = 'isPrimary'
+      AND condition_extension.extension[0].valueBoolean = true
+)
+SELECT
+    dx.person_uuid,
+    dx.encounter_id,
+    dx.encounter_identifier,
+    dx.admit_datetime,
+    dx.discharge_datetime,
+    coding.code::varchar AS condition_code,
+    coding.display::varchar AS condition_display,
+    dx.condition_code.text::varchar AS condition_description
+FROM primary_dx dx
+    LEFT JOIN dx.condition_code.coding AS coding ON true
+
+```
+
+```
+WITH enc AS (
+  SELECT
+      e.person_uuid,
+      e.id::varchar AS encounter_id,
+      e.period.start::timestamptz AS admit_datetime,
+      e.period."end"::timestamptz AS discharge_datetime,
+      e.diagnosis as encounter_diagnosis
+  FROM fhir.encounter e
+  limit 1000
+),
+enc_dx AS (
+  SELECT
+      e.person_uuid,
+      e.encounter_id,
+      e.admit_datetime,
+      e.discharge_datetime,
+      dx.condition,
+      dx.rank as dx_rank
+  FROM enc e
+    LEFT JOIN e.encounter_diagnosis dx ON TRUE
+),
+enc_condition AS (
+  SELECT
+      e.person_uuid,
+      e.encounter_id,
+      e.dx_rank,
+      c.code AS condition_code,
+      c.extension as condition_extension
+  FROM enc_dx e,
+       fhir.condition c
+  WHERE c.reference_id = e.condition.reference
+),
+enc_condition_is_primary as (
+	select
+	  c.person_uuid,
+	  c.encounter_id,
+	  c.dx_rank,
+	  c.condition_code
+	from
+	  enc_condition c
+      LEFT JOIN c.condition_extension ext ON TRUE
+	where 
+	  ext.url = 'http://careevolution.com/fhirextensions#properties'
+	  and ext.extension[0].url = 'isPrimary'
+	  and ext.extension[0].valueboolean = true
+)
+select 
+	enc.person_uuid,
+	enc.encounter_id,
+	enc.admit_datetime,
+	enc.discharge_datetime,
+	pdx.condition_code.coding[0].code::varchar as primary_dx,
+	pdx.condition_code.text::varchar
+from enc
+left outer join enc_condition_is_primary pdx on pdx.person_uuid = enc.person_uuid 
+and pdx.encounter_id  = enc.encounter_id
+```
+
+For any queries related to encounter location (room, bed, unit or office) use the following approach unless the user specifies otherwise:
+use fhir.location.description for the name of the location
+```sql
+WITH encounter_loc_entries AS (
+  SELECT
+      e.person_uuid,
+      e.id                               AS encounter_id,
+      loc.location.reference::varchar              AS location_reference,
+      row_number() over (partition by e.id order by coalesce(loc.period."end", loc.period.start) desc) rn
+  FROM fhir.encounter e,
+       e.location AS loc
+)
+SELECT
+    el.person_uuid,
+    el.encounter_id,
+    l.reference_id                                 AS location_reference_id,
+    l.description::varchar                                AS location_name
+from
+	encounter_loc_entries el
+	join fhir.location l on l.reference_id = el.location_reference and el.rn = 1
+
+```
+
+For any queries related to the PRIMARY or BEST ONE doctor or provider for an encounter use the following approach unless the user specifies otherwise:
+```
+with enc as (
+	select
+	person_uuid,
+	id,
+	participant
+	from fhir.encounter e
+	limit 100
+), 
+prioritized_practitioners_for_encounter as (
+  SELECT
+      e.person_uuid,
+      e.id::varchar                           			AS encounter_id,
+      part.individual.reference::varchar                AS practitioner_reference,
+      row_number() over (partition by e.id order by 
+      	(case 
+	      	when coding.code::varchar = 'ATND' then 1 -- Attending
+	      	when coding.code::varchar = 'ADM' then 2 -- Admitting
+	      	else 3
+	     end),
+      	 coalesce(part.period."end"::timestamptz, part.period.start::timestamptz) desc
+      ) as priority
+  FROM enc e,
+       e.participant AS part,
+       part.type AS ptype,
+       ptype.coding AS coding
+  WHERE part.individual.reference::varchar LIKE 'Practitioner/%'   -- Only Practitioner refs
+),
+best_practitioner_for_encounter as (
+	select 
+		person_uuid,
+		encounter_id,
+		name[0].family::varchar as last_name,
+		name[0].given[0]::varchar as first_name,
+		identifier[0].value::varchar as identifier
+	from prioritized_practitioners_for_encounter
+	join fhir.practitioner pract on pract.reference_id = practitioner_reference
+	where priority = 1
+)
+select enc.person_uuid, enc.id,
+pract.last_name as provider_last_name, 
+pract.first_name as provider_first_name,
+pract.identifier as provider_identifier
+from enc 
+left outer join best_practitioner_for_encounter pract on enc.id = pract.encounter_id
+ and enc.person_uuid = pract.person_uuid
+
+```
+
+Hospitalization encounters have patient.class.coding[0].code = 'IMP' and patient.class.coding[0].system = 'http://terminology.hl7.org/CodeSystem/v3-ActCode'
+These encounter have additional properties:
+
+```
+-- List hospitalizations (FHIR Encounter) with admit source and discharge disposition
+-- Uses Encounter.hospitalization.* fields per https://hl7.org/fhir/R4/encounter.html
+-- Filters to inpatient encounters by Encounter.class.code (e.g., 'IMP' or 'inpatient')
+-- Returns one row per Encounter
+SELECT
+    e.person_uuid,
+    e.id::varchar                                  AS encounter_id,
+    e.status::varchar                              AS encounter_status,
+    e."class".code::varchar                        AS encounter_class_code,
+    e.period.start::timestamp                      AS admit_datetime,
+    e.period."end"::timestamp                      AS discharge_datetime,
+
+    /* Admit Source: prefer human-readable text; fall back to first coding display, then code */
+    COALESCE(
+        e.hospitalization.admitSource.text::varchar,
+        e.hospitalization.admitSource.coding[0].display::varchar,
+        e.hospitalization.admitSource.coding[0].code::varchar
+    )                                              AS admit_source,
+
+    /* Discharge Disposition: prefer human-readable text; fall back to first coding display, then code */
+    COALESCE(
+        e.hospitalization.dischargeDisposition.text::varchar,
+        e.hospitalization.dischargeDisposition.coding[0].display::varchar,
+        e.hospitalization.dischargeDisposition.coding[0].code::varchar
+    )                                              AS discharge_disposition
+FROM fhir.encounter e
+WHERE
+    /* Inpatient class. Commonly code 'IMP' from v3-ActCode, but allow plain 'inpatient' too */
+    LOWER(e."class".code::varchar) IN ('imp','inpatient')
+ORDER BY admit_datetime DESC NULLS LAST, encounter_id
+LIMIT 100;
+
+```
+

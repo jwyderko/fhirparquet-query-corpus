@@ -1,0 +1,199 @@
+Use the following pattern for accession Identifier (accession number) in Observation resources unless the user specifies otherwise:
+
+Accession number is stored in the `fhir.diagnosticreport.extension` array with:
+- extension.url = 'http://rosetta.careevolution.com/FHIR/StructureDefinition/extension/diagnosticreport-accessionNumbers'
+- extension.extension contains the Identifier with `system` and `value` fields
+
+Examples:
+
+```sql
+select 
+    dr.id,
+    dre.valueidentifier."system"::varchar accession_system,
+    dre.valueidentifier."value"::varchar accession_number, 
+    dr.inserted_timestamp
+from fhir.diagnosticreport dr
+    join dr.extension dre on true
+where 
+    dre.url::varchar = 'http://rosetta.careevolution.com/FHIR/StructureDefinition/extension/diagnosticReport-accessionNumber'
+LIMIT 100
+```
+
+```sql
+/* CE CDM Query Copilot 
+   Labs for MRN list (FHIR, Option A: DiagnosticReport.result → Observation)
+   - Placeholder for MRNs: :MRN_LIST
+   - Detect labs via DiagnosticReport.category = 'LAB' (HL7 v2-0074)
+   - Includes accession number, value + units, normal range, abnormal flags
+*/
+
+WITH patients AS (
+    /* Map MRNs to person_uuid */
+    SELECT
+        p.person_uuid,
+        idn.value::varchar AS mrn
+    FROM fhir.patient p
+        LEFT JOIN p.identifier AS idn ON TRUE
+        LEFT JOIN idn.type.coding AS idn_type ON TRUE
+    WHERE idn.value::varchar IN (:MRN_LIST)
+      AND idn_type."system"::varchar = 'http://terminology.hl7.org/CodeSystem/v2-0203'
+      AND idn_type.code::varchar = 'MR'
+),
+dr_base AS (
+    /* DiagnosticReports for those patients that are LAB category; compute accession */
+    SELECT
+        dr.person_uuid,
+        dr.reference_id AS dr_reference,
+        dr_extension_extension.valueidentifier.value::varchar AS accession_number,
+        dr_extension_extension.valueidentifier."system"::varchar AS accession_system
+    FROM fhir.diagnosticreport dr
+        LEFT JOIN dr.category AS dr_category ON TRUE
+        LEFT JOIN dr_category.coding AS dr_category_coding ON TRUE	
+        LEFT JOIN dr.extension AS dr_extension ON TRUE
+        LEFT JOIN dr_extension.extension AS dr_extension_extension ON TRUE
+    WHERE dr.person_uuid IN (SELECT person_uuid FROM patients)
+      AND dr_category_coding.code::varchar = 'LAB'
+      AND dr_extension.url = 'http://rosetta.careevolution.com/FHIR/StructureDefinition/extension/diagnosticreport-accessionNumbers'
+),
+dr_results AS (
+    /* Unnest DiagnosticReport.result → Observation references */
+    SELECT
+        b.person_uuid,
+        b.dr_reference,
+        b.accession_number,
+        res.reference::varchar AS obs_reference
+    FROM fhir.diagnosticreport dr
+        LEFT JOIN dr.result AS res ON true
+        JOIN dr_base b
+          ON b.dr_reference = dr.reference_id
+),
+obs_expanded AS (
+    /* Expand Observation value, units, ranges, and interpretation (abnormal flags) */
+    SELECT
+        o.person_uuid,
+        o.reference_id AS obs_reference,
+        o.effectiveDateTime AS observation_datetime,
+        /* prefer LOINC if present */
+        code_c."system"::varchar AS code_system,
+        code_c.code::varchar   AS code_value,
+        COALESCE(code_c.display::varchar, o.code.text::varchar) AS code_display,
+        /* value + units (handle different value types) */
+        COALESCE(
+            o.valueString::varchar,
+            o.valueQuantity.value::varchar,
+            o.valueCodeableConcept.text::varchar
+        ) AS result_value,
+        /* units from valueQuantity when present */
+        COALESCE(
+            o.valueQuantity.unit::varchar,
+            o.valueQuantity.code::varchar
+        ) AS result_units,
+        /* normal range (take first available range if multiple) */
+        rr.low.value::varchar  AS ref_range_low_value,
+        rr.low.unit::varchar   AS ref_range_low_unit,
+        rr.high.value::varchar AS ref_range_high_value,
+        rr.high.unit::varchar  AS ref_range_high_unit,
+        /* abnormal flags (HL7 interpretation codes: H/L/A/etc.) */
+        intrp_c.code::varchar    AS abnormal_flag_code,
+        intrp_c.display::varchar AS abnormal_flag_display
+    FROM fhir.observation o
+        LEFT JOIN o.code.coding       AS code_c  ON true
+        LEFT JOIN o.referenceRange    AS rr      ON true
+        LEFT JOIN o.interpretation    AS intrp   ON true
+        LEFT JOIN intrp.coding        AS intrp_c ON true
+)
+SELECT
+    p.mrn,
+    d.accession_number,
+    oe.observation_datetime,
+    oe.code_system,
+    oe.code_value,
+    oe.code_display,
+    oe.result_value,
+    oe.result_units,
+    oe.ref_range_low_value,
+    oe.ref_range_low_unit,
+    oe.ref_range_high_value,
+    oe.ref_range_high_unit,
+    oe.abnormal_flag_code,
+    oe.abnormal_flag_display,
+    d.dr_reference       AS diagnosticreport_reference,
+    oe.obs_reference     AS observation_reference,
+    d.person_uuid
+FROM dr_results d
+JOIN obs_expanded oe
+  ON oe.obs_reference = d.obs_reference
+ AND oe.person_uuid   = d.person_uuid
+JOIN patients p
+  ON p.person_uuid = d.person_uuid
+ORDER BY p.mrn, oe.observation_datetime NULLS LAST, oe.code_display
+LIMIT 100;
+```
+
+Prompt: Get lab results and vitals from FHIR Observations - include both Numerical and String Values
+```sql
+SELECT 
+    coding.code::varchar,
+    coding.display::varchar,
+    coding."system"::varchar as "system",
+    categorycoding.code::varchar as categorycode,
+    obs.id,
+    obs.effectivedatetime,
+    obs.valuequantity.value::decimal as valuequantity,
+    obs.valuequantity.comparator::varchar as comparator,
+    obs.valuequantity.unit::varchar as units,
+    obs.valuestring::varchar as valuestring,
+    obs.valuerange.low.value::decimal as valuelow,
+    obs.valuerange.low.unit::varchar as valuelowunits,
+    obs.valuerange.high.value::decimal as valuehigh,
+    obs.valueratio.numerator.value::decimal as valuenumerator,
+    obs.valueratio.numerator.unit::varchar as valuenumeratorunits,
+    obs.valueratio.denominator.value::decimal as valuedenominator
+FROM 
+    fhir.observation obs
+    JOIN obs.code.coding as coding ON true
+    JOIN obs.category as category ON true
+    JOIN category.coding as categorycoding ON true
+WHERE "system" IN ('http://loinc.org','http://snomed.info/sct')
+LIMIT 100;
+```
+
+Prompt: Get lab results and vitals from FHIR Observations - Use Coded Values
+```sql
+SELECT 
+    coding.code::varchar,
+    coding.display::varchar,
+    coding."system"::varchar as "system",
+    categorycoding.code::varchar as categorycode,
+    obs.id,
+    obs.effectivedatetime,
+    valuecodeableconcept_coding.code::varchar as valuecode,
+    valuecodeableconcept_coding.display::varchar as valuedisplay
+FROM fhir.observation obs
+    JOIN obs.code.coding as coding ON true
+    JOIN obs.valuecodeableconcept.coding AS valuecodeableconcept_coding ON TRUE
+    LEFT JOIN obs.category as category ON true
+    LEFT JOIN category.coding as categorycoding ON TRUE
+LIMIT 100;
+```
+
+Prompt: Retrieve Observations grouped in DiagnosticReports
+```sql
+SELECT 
+    dr.id, 
+    dr.effectivedatetime, 
+    dr.conclusion,
+    obs.id, 
+    obs.effectivedatetime, 
+    obs.valuequantity, 
+    obs.valuestring, 
+    obs.valuecodeableconcept,
+    categorycoding.code::varchar as categorycode
+FROM 
+    fhir.diagnosticreport dr
+    JOIN dr.result as result ON true
+    JOIN dr.category as category ON true
+    JOIN category.coding as categorycoding ON true
+    JOIN fhir.observation obs ON obs.person_uuid = dr.person_uuid AND obs.reference_id = result.reference::varchar
+LIMIT 100;
+```

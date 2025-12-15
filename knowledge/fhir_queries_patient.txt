@@ -1,0 +1,254 @@
+SUMMARY: all these queries use the `fhir` schema. Use these query patterns for patient-related queries unless the user specifies otherwise.
+
+The following concepts are ONLY available in the FHIR schema. If asked for these concepts
+automatically choose the FHIR schema (NOT OMOP)
+- patient names
+- medical record numbers (MRN)
+- primary care providers (PCP)
+- patient address
+- patient telephone and contact information
+
+For any queries related to medical records number (MRN) use the following approach unless the user specifies otherwise:
+- MRNs are stored in the `fhir.patient.identifier` array
+- The MRN type code is 'MR' in `fhir.patient.identifier.type.coding[0].code`
+- The MRN type system is 'http://terminology.hl7.org/CodeSystem/v2-0203' in `fhir.patient.identifier.type.coding[0].system`
+
+```
+with persons as (
+select
+    person_uuid,
+    identifier
+from fhir.patient p
+limit 100
+)
+select 
+    p.person_uuid,
+    patient_identifier.value::varchar as mrn
+from persons p
+    LEFT JOIN p.identifier as patient_identifier ON TRUE
+    LEFT JOIN patient_identifier.type.coding AS patient_identifier_type_coding ON TRUE
+where patient_identifier_type_coding.code = 'MR'
+and patient_identifier_type_coding."system" = 'http://terminology.hl7.org/CodeSystem/v2-0203'
+```
+
+```
+select
+person_uuid
+from fhir.patient pt,
+pt.identifier as patient_identifier,
+patient_identifier.type.coding as patient_identifier_type_coding
+where patient_identifier_type_coding.code = 'MR'
+and patient_identifier_type_coding."system" = 'http://terminology.hl7.org/CodeSystem/v2-0203'
+and patient_identifier.value in ('MRN001','MRN002','MRN003')
+```
+
+For any queries related to patient name use the following approach unless the user specifies otherwise:
+- Patient names are stored in the `fhir.patient.name` array
+- Each name has `family` and `given` fields for last and first names respectively
+- Use fhir.patient.name.use = 'official'
+
+```
+with persons as (
+select
+person_uuid,
+name
+from fhir.patient p
+limit 100
+)
+select 
+p.person_uuid,
+patient_name.family::varchar as last_name,
+patient_name.given[0]::varchar as first_name
+from persons p,
+p.name as patient_name
+where patient_name.use = 'official'
+```
+
+For any queries related to primary care providers (PCP) use the following approach unless the user specifies otherwise:
+- Always get PCP info from FHIR schema
+- The PCP reference is in `fhir.patient.generalPractitioner[0].reference`
+- If asked for a practitioner identifier, prefer 
+1. `fhir.practitioner.identifier` with type code 'PRN' and system 'http://terminology.hl7.org/CodeSystem/v2-0203'
+2. `fhir.practitioner.identifier` with type code 'NPI' and system 'http://terminology.hl7.org/CodeSystem/v2-0203' 
+
+```sql
+WITH patient_by_mrn AS (
+    SELECT DISTINCT
+        pt.person_uuid,
+        pt.reference_id::varchar                              AS patient_reference_id,
+        patient_identifier.value::varchar                                    AS mrn,
+        /* PCP reference is the first element of generalPractitioner */
+        pt.generalPractitioner[0].reference::varchar          AS pcp_reference
+    FROM fhir.patient pt
+        LEFT JOIN pt.identifier              AS patient_identifier           ON TRUE
+        LEFT JOIN patient_identifier.type.coding            AS patient_identifier_type      ON TRUE
+    WHERE patient_identifier_type.code::varchar   = 'MR'
+      AND patient_identifier_type."system"::varchar = 'http://terminology.hl7.org/CodeSystem/v2-0203'
+      AND patient_identifier.value::varchar       = :MRN
+),
+/* Choose the best name for the PCP practitioner (prefer name.use = 'official') */
+practitioner_name AS (
+    SELECT
+        pr.reference_id::varchar                      AS practitioner_reference_id,
+        TRIM(
+            COALESCE(nm.family::varchar, '') || ', ' || COALESCE(nm.given[0]::varchar, '')
+        ) AS full_name,
+        ROW_NUMBER() OVER (
+            PARTITION BY pr.reference_id
+            ORDER BY CASE WHEN nm.use::varchar = 'official' THEN 1 ELSE 2 END
+        ) AS rn
+    FROM fhir.practitioner pr
+        LEFT JOIN pr.name AS nm ON TRUE
+        JOIN patient_by_mrn pm
+          ON pm.pcp_reference = pr.reference_id
+),
+/* Pick the practitioner identifier, prioritizing PRN first, then NPI */
+practitioner_identifier AS (
+    SELECT
+        pr.reference_id::varchar                      AS practitioner_reference_id,
+        pid.value::varchar                            AS pcp_number,
+        pid_type.code::varchar                        AS id_type_code,
+        ROW_NUMBER() OVER (
+            PARTITION BY pr.reference_id
+            ORDER BY
+                CASE
+                    WHEN pid_type.code::varchar = 'PRN' THEN 1
+                    WHEN pid_type.code::varchar = 'NPI' THEN 2
+                    ELSE 3
+                END,
+                pid.value::varchar
+        ) AS rn
+    FROM fhir.practitioner pr
+        LEFT JOIN pr.identifier       AS pid       ON TRUE
+        LEFT JOIN pid.type.coding     AS pid_type  ON TRUE
+        JOIN patient_by_mrn pm
+          ON pm.pcp_reference = pr.reference_id
+    WHERE pid_type."system"::varchar = 'http://terminology.hl7.org/CodeSystem/v2-0203'
+      AND pid_type.code::varchar IN ('PRN','NPI')
+)
+SELECT
+    pm.person_uuid,
+    pm.mrn,
+    pn.full_name AS pcp_name,
+    pi.pcp_number
+FROM patient_by_mrn pm
+LEFT JOIN practitioner_name pn
+  ON pn.practitioner_reference_id = pm.pcp_reference
+ AND pn.rn = 1
+LEFT JOIN practitioner_identifier pi
+  ON pi.practitioner_reference_id = pm.pcp_reference
+ AND pi.rn = 1
+LIMIT 100;
+```
+
+
+The following concepts are stored in `fhir.patient.extension` array. Use these query patterns unless the user specifies otherwise.
+DO NOT look up urls; use the urls below; determine values ONLY as described below:
+- "birth sex": extension.url = 'http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex', value in extension.extension[0].valuecodeableconcept.text
+- "ethnicity": extension.url = 'http://hl7.org/fhir/us/core/StructureDefinition/us-core-ethnicity', value in extension.extension[0].valueString
+- "gender identity": extension.url = 'http://hl7.org/fhir/us/core/StructureDefinition/us-core-genderIdentity', value in extension.valuecodeableconcept.text
+- "race": extension.url = 'http://hl7.org/fhir/us/core/StructureDefinition/us-core-race', value in extension.extension[0].valueString
+- "sexual orientation": extension.url = 'http://rosetta.careevolution.com/FHIR/StructureDefinition/extension/patient-sexualOrientation', value in extension.valueString
+- "MyChart status": extension.url = 'http://rosetta.careevolution.com/FHIR/StructureDefinition/extension/patient-myChartStatus', value in extension.valueString
+- "Research Recruitment Preference": extension.url = 'http://rosetta.careevolution.com/FHIR/StructureDefinition/extension/patient-researchRecruitmentPreference', value in extension.valueString
+- "religion": extension.url = 'http://hl7.org/fhir/StructureDefinition/patient-religion', value in extension.valuecodeableconcept.text
+
+example query include an extension concept (in this case, "birth sex") for patient list 
+
+```
+with patient_list as (
+select
+	id,
+    person_uuid,
+    extension
+from fhir.patient
+limit 100
+)
+select
+    p.id,
+    p.person_uuid,
+    e.extension[0].valuecodeableconcept.text::varchar as birthsex
+from 
+    patient_list p, p.extension e
+where
+    e.url = 'http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex'
+```
+
+example query to find patients with a specific extension concept (in this case birthsex = 'Male')
+
+```
+select
+    id,
+    person_uuid
+from
+    fhir.patient p, p.extension e
+where
+    e.url = 'http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex'
+    and e.extension[0].valuecodeableconcept.text = 'Male'
+limit 100;
+```
+
+Example query: create table of all addresses:
+
+```sql
+/* CE CDM Query Copilot
+   FHIR → Flatten patient.address into a separate table-like view
+   - Produces one row per address per patient
+   - Includes MRN (identifier.type.coding = 'MR' w/ v2-0203 system)
+   - Keeps person_uuid for cross-schema linkage
+*/
+
+WITH mrn AS (
+  /* One MRN per patient (may return multiple if multiple MRNs exist) */
+  SELECT DISTINCT
+      p.person_uuid,
+      patient_identifier.value::varchar AS mrn
+  FROM fhir.patient p
+       LEFT JOIN p.identifier AS patient_identifier ON TRUE
+       LEFT JOIN patient_identifier.type.coding AS patient_identifier_type_coding ON TRUE
+  WHERE patient_identifier_type_coding.code::varchar = 'MR'
+    AND patient_identifier_type_coding."system"::varchar = 'http://terminology.hl7.org/CodeSystem/v2-0203'
+),
+addr AS (
+  /* Expand all addresses for each patient */
+  SELECT
+      pt.person_uuid,
+      pt.id::varchar                                    AS fhir_patient_id,
+      a.use::varchar                                    AS address_use,          -- home | work | temp | old | billing | etc.
+      a.line[0]::varchar                                AS address_line1,
+      a.line[1]::varchar                                AS address_line2,
+      a.city::varchar                                   AS city,
+      a.state::varchar                                  AS state,
+      a.postalCode::varchar                             AS postal_code,
+      a.country::varchar                                AS country,
+      a.period.start::timestamptz                       AS valid_from,
+      a.period."end"::timestamptz                       AS valid_to
+  FROM fhir.patient pt
+       LEFT JOIN pt.address AS a ON TRUE
+)
+SELECT
+    a.person_uuid,
+    a.fhir_patient_id,
+    m.mrn,
+    a.address_use,
+    a.address_line1,
+    a.address_line2,
+    a.city,
+    a.state,
+    a.postal_code,
+    a.country,
+    a.valid_from,
+    a.valid_to
+FROM addr a
+LEFT JOIN mrn m
+  ON m.person_uuid = a.person_uuid
+```
+
+If provided with a file of MRNs or person_uuids, create a temp table with UNION ALL syntax and use it in the query, for example:
+```
+CREATE TEMP TABLE mrns (mrn VARCHAR);
+INSERT INTO mrns (mrn)
+SELECT 'MRN_1' UNION ALL
+SELECT 'MRN_2' UNION ALL
+SELECT 'MRN_3';
+```

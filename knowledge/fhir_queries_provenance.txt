@@ -1,0 +1,218 @@
+If asked for provenance information for patients from Epic Clarity (include "pat id"), use the following query pattern:
+```sql
+-- Find Epic Clarity pat_id for a patient by MRN
+WITH patient_mrn AS (
+    SELECT DISTINCT
+        pt.person_uuid,
+        ident.value::varchar AS mrn,
+        pt.reference_id AS reference_id
+    FROM fhir.patient pt 
+        JOIN pt.identifier AS ident ON true
+        JOIN ident.type.coding AS idtype_coding ON true
+    WHERE idtype_coding.code::varchar = 'MR'
+      AND idtype_coding."system"::varchar = 'http://terminology.hl7.org/CodeSystem/v2-0203'
+      AND ident.value::varchar = :MRN
+)
+SELECT
+    prov.target[0].reference::varchar AS reference_id,
+    MAX(
+        CASE WHEN ext2.url = 'clarity_table'
+             THEN ext2.valueString::varchar END
+    ) AS epic_clarity_table_name,
+    MAX(
+        CASE WHEN ext2.url = 'extract-patient-path'
+             THEN ext2.valueString::varchar END
+    ) AS extract_patient_path,
+    MAX(
+        CASE WHEN ext2.url = 'extract-patient-id'
+             THEN ext2.valueString::varchar END
+    ) AS clarity_pat_id
+FROM fhir.provenance prov 
+    LEFT JOIN prov.agent a ON true
+    LEFT JOIN a.extension ext ON true
+    LEFT JOIN ext.extension ext2 ON TRUE
+    JOIN patient_mrn ON patient_mrn.person_uuid = prov.person_uuid 
+    	AND patient_mrn.reference_id = prov.target[0].reference
+WHERE
+	prov.person_uuid IN (SELECT person_uuid FROM patient_mrn)
+	AND a.who.display::varchar = 'EpicClarity'
+GROUP BY
+	prov.target[0].reference::varchar
+``` 
+
+Information about the Epic Clarity provenance, source, or origin of any resource is stored in the `fhir.provenance` table. 
+Join the `fhir.provenance` table to any resource using the resources `reference_id` and `person_uuid`.
+Only use information in the provenance.agent field for Epic Clarity related provenance.
+
+Use this exact query pattern for
+* Epic (Clarity) provenance information
+* Epic (Clarity) pat_id or patient_identifier
+* Epic (Clarity) table and column name
+* Extract patient path or extract extraction id
+
+JOIN the `reference_id` of the target resource to the `provenance.target[0].reference` field in the query below
+
+Examples:
+```sql
+-- EXAMPLE: find all Epic Clarity provenance information for all conditions for an person_uuid
+with find_resources as (
+    select 
+        reference_id, 
+        person_uuid
+    from fhir.condition
+    where person_uuid = :PERSON_UUID
+)
+select
+    t.reference::varchar reference,
+    a.who.display::varchar agent_who,
+    a_type_coding_at.code::varchar agent_type,
+    property_extension.url::varchar property_name,
+    property_extension.valuestring::varchar property_value
+from 
+    cdm_qa.fhir.provenance p
+    join p.target t on true
+    join p.agent a on true
+    join a."type".coding a_type_coding_at on true
+    join a.extension a_extension on true
+    join a_extension.extension property_extension on true
+    join find_resources fr on fr.person_uuid = p.person_uuid and fr.reference_id = t.reference
+where 
+    a_type_coding_at."system" = 'http://rosetta.careevolution.com/FHIR/CodeSystem/AgentType'
+    and a_extension.url = 'http://rosetta.careevolution.com/FHIR/StructureDefinition/extension/provenance-agent-properties'
+order by reference, property_name
+```
+
+
+
+```sql
+-- EXAMPLE: find Clarity table name, extract patient path, and Clarity pat_id for all observations for an person_uuid
+WITH resources AS (
+    SELECT
+        o.person_uuid,
+        o.reference_id
+    FROM fhir.observation o
+    WHERE o.person_uuid = :PERSON_UUID
+)
+SELECT
+    target[0].reference::varchar AS reference_id,
+    MAX(
+        CASE
+            WHEN ext2.url = 'clarity_table'
+            THEN ext2.valueString::varchar
+        END
+    ) AS epic_clarity_table_name,
+    MAX(
+        CASE
+            WHEN ext2.url = 'extract-patient-path'
+            THEN ext2.valueString::varchar
+        END
+    ) AS extract_patient_path,
+    MAX(
+        CASE
+            WHEN ext2.url = 'extract-patient-id'
+            THEN ext2.valueString::varchar
+        END
+    ) AS clarity_pat_id,
+    MAX(
+        CASE
+            WHEN ext2.url = 'extract-extraction-id'
+            THEN ext2.valueString::varchar
+        END
+    ) AS extraction_id
+FROM fhir.provenance prov
+    LEFT JOIN prov.agent a ON true
+    LEFT JOIN a.extension ext ON true
+    LEFT JOIN ext.extension ext2 ON true
+    JOIN resources ON resources.person_uuid = prov.person_uuid 
+    	AND resources.reference_id = prov.target[0].reference
+WHERE a.who.display::varchar = 'EpicClarity'
+GROUP BY target[0].reference::varchar
+```
+
+```sql
+/* CE CDM Query Copilot
+   Output: one row per Condition (by reference), including Epic Clarity clarity_table name, extract-patient-id (pat_id), and extract-extraction-id.
+   Conventions: person_uuid included; SUPER arrays unnested with LEFT JOIN ... ON true; LIMIT 100.
+*/
+
+WITH patient_mrn AS (
+    SELECT DISTINCT
+        pt.person_uuid,
+        pt.reference_id                          AS patient_reference_id
+    FROM fhir.patient pt
+    LEFT JOIN pt.identifier            ident            ON true
+    LEFT JOIN ident.type.coding        idtype_coding    ON true
+    WHERE idtype_coding.code::varchar   = 'MR'
+      AND idtype_coding."system"::varchar = 'http://terminology.hl7.org/CodeSystem/v2-0203'
+      AND ident.value::varchar = :MRN
+),
+patient_conditions AS (
+    SELECT
+        c.person_uuid,
+        c.id::varchar                 AS condition_id,
+        c.reference_id::varchar       AS condition_reference_id
+    FROM fhir."condition" c
+    JOIN patient_mrn pm
+      ON pm.person_uuid = c.person_uuid
+),
+resources AS (
+    -- resources we will seek provenance for (by person_uuid + reference_id)
+    SELECT
+        pc.person_uuid,
+        pc.condition_reference_id::varchar AS reference_id,
+        pc.condition_id::varchar           AS condition_id
+    FROM patient_conditions pc
+    WHERE pc.condition_reference_id IS NOT NULL
+)
+SELECT
+    r.person_uuid,
+    r.condition_id,
+    r.reference_id                                         AS condition_reference_id,
+    MAX(CASE WHEN ext2.url::varchar = 'clarity_table'
+             THEN ext2.valueString::varchar END)           AS epic_clarity_table_name,
+    MAX(CASE WHEN ext2.url::varchar = 'extract-patient-id'
+             THEN ext2.valueString::varchar END)           AS clarity_pat_id,
+    MAX(CASE WHEN ext2.url::varchar = 'extract-extraction-id'
+             THEN ext2.valueString::varchar END)           AS extraction_id
+FROM fhir.provenance prov
+LEFT JOIN prov.agent          a    ON true
+LEFT JOIN a.extension         ext  ON true
+LEFT JOIN ext.extension       ext2 ON true
+JOIN resources r
+  ON r.person_uuid = prov.person_uuid
+ AND r.reference_id = prov.target[0].reference::varchar
+WHERE a.who.display::varchar = 'EpicClarity'
+GROUP BY
+    r.person_uuid,
+    r.condition_id,
+    r.reference_id
+ORDER BY
+    r.person_uuid,
+    r.condition_id
+LIMIT 100;
+```
+
+Prompt: When was the data extracted from the source system?
+```sql
+SELECT
+    p_target.reference::varchar as fhir_resource,
+    p.recorded as fhir_updated
+FROM fhir.provenance p
+    JOIN fhir.condition c ON p.person_uuid = c.person_uuid AND c.reference_id = p.target[0].reference
+WHERE 
+    c.person_uuid = :PERSON_UUID 
+```
+
+Prompt: Find all available agent types in the provenance table
+```sql
+select
+    agent_type_coding.code::varchar agent_type_code,
+    count(distinct p.id) ct
+from fhir.provenance p,
+    p.target t,
+    p.agent a,
+    a.type.coding agent_type_coding
+where agent_type_coding."system" = 'http://rosetta.careevolution.com/FHIR/CodeSystem/AgentType'
+group by 1
+order by 1
+```

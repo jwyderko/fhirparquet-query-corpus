@@ -1,0 +1,278 @@
+SUMMARY: all these queries use the `omop` schema.
+
+Prompt:
+Find all office visits for a patient with MRN = 12345 that occur in 2020
+```sql
+SELECT DISTINCT
+p.person_uuid,
+v.visit_occurrence_id,
+v.visit_start_datetime,
+v.visit_end_datetime,
+v.visit_concept_id,
+c.concept_name AS visit_type
+FROM omop.visit_occurrence v
+JOIN omop.person p
+ON p.person_id = v.person_id
+LEFT JOIN omop.concept c
+ON c.concept_id = v.visit_concept_id
+WHERE p.person_source_value = '12345' -- MRN in OMOP source value
+AND v.visit_start_datetime::date >= '2020-01-01'::date
+AND v.visit_start_datetime::date < '2021-01-01'::date
+AND v.visit_concept_id = 9202 -- Outpatient (office) visit
+LIMIT 100;
+```
+
+Prompt:
+Find all hospitalizations for a patient with MRN = 12345 that occur in 2020 with the top 3 diagnoses for the hospitalization. 
+One row per hospitalization; each diagnosis in a separate column.
+```sql
+WITH patient AS (
+SELECT p.person_id, p.person_uuid
+FROM omop.person p
+WHERE p.person_source_value = '12345'
+),
+hosp_visits AS (
+SELECT
+v.visit_occurrence_id,
+v.person_id,
+v.person_uuid,
+v.visit_start_datetime,
+v.visit_end_datetime,
+v.visit_concept_id
+FROM omop.visit_occurrence v
+JOIN patient p
+ON p.person_id = v.person_id
+WHERE v.visit_start_datetime::date >= '2020-01-01'::date
+AND v.visit_start_datetime::date < '2021-01-01'::date
+AND v.visit_concept_id IN (9201, 9203) -- Inpatient; ER+Inpatient
+),
+visit_dx_ranked AS (
+SELECT
+hv.visit_occurrence_id,
+hv.person_id,
+hv.person_uuid,
+co.condition_occurrence_id,
+co.condition_concept_id,
+co.condition_source_value,
+co.condition_start_datetime,
+ROW_NUMBER() OVER (
+PARTITION BY hv.visit_occurrence_id
+ORDER BY co.condition_start_datetime NULLS LAST, co.condition_occurrence_id
+) AS rn
+FROM hosp_visits hv
+LEFT JOIN omop.condition_occurrence co
+ON co.visit_occurrence_id = hv.visit_occurrence_id
+AND co.person_id = hv.person_id
+),
+dx_codes AS (
+SELECT
+vdr.visit_occurrence_id,
+vdr.person_id,
+vdr.person_uuid,
+vdr.rn,
+COALESCE(cdx.concept_code, vdr.condition_source_value)::varchar AS dx_code,
+COALESCE(cdx.concept_name, vdr.condition_source_value)::varchar AS dx_name,
+cdx.vocabulary_id::varchar AS dx_vocabulary_id
+FROM visit_dx_ranked vdr
+LEFT JOIN omop.concept cdx
+ON cdx.concept_id = vdr.condition_concept_id
+WHERE vdr.rn <= 3
+)
+SELECT
+hv.person_uuid,
+hv.visit_occurrence_id,
+hv.visit_start_datetime,
+hv.visit_end_datetime,
+hv.visit_concept_id,
+vc.concept_name AS visit_type,
+MAX(CASE WHEN dx.rn = 1 THEN dx.dx_code END)::varchar AS diagnosis1_code,
+MAX(CASE WHEN dx.rn = 1 THEN dx.dx_name END)::varchar AS diagnosis1_name,
+MAX(CASE WHEN dx.rn = 1 THEN dx.dx_vocabulary_id END)::varchar AS diagnosis1_vocab,
+MAX(CASE WHEN dx.rn = 2 THEN dx.dx_code END)::varchar AS diagnosis2_code,
+MAX(CASE WHEN dx.rn = 2 THEN dx.dx_name END)::varchar AS diagnosis2_name,
+MAX(CASE WHEN dx.rn = 2 THEN dx.dx_vocabulary_id END)::varchar AS diagnosis2_vocab,
+MAX(CASE WHEN dx.rn = 3 THEN dx.dx_code END)::varchar AS diagnosis3_code,
+MAX(CASE WHEN dx.rn = 3 THEN dx.dx_name END)::varchar AS diagnosis3_name,
+MAX(CASE WHEN dx.rn = 3 THEN dx.dx_vocabulary_id END)::varchar AS diagnosis3_vocab
+FROM hosp_visits hv
+LEFT JOIN dx_codes dx
+ON dx.visit_occurrence_id = hv.visit_occurrence_id
+AND dx.person_id = hv.person_id
+LEFT JOIN omop.concept vc
+ON vc.concept_id = hv.visit_concept_id
+GROUP BY
+hv.person_uuid,
+hv.visit_occurrence_id,
+hv.visit_start_datetime,
+hv.visit_end_datetime,
+hv.visit_concept_id,
+vc.concept_name
+ORDER BY hv.visit_start_datetime
+LIMIT 100;
+```
+
+Prompt: Create a patient list of all patients in cohort 23; include MRN, birthdate and the concept names for gender, race and ethnicity.
+```sql
+select 
+	p.person_source_value, 
+	p.birth_datetime, 
+	c_gender.concept_name,
+	c_race.concept_name,
+	c_ethnicity.concept_name
+from 
+	omop_results.cohort c
+	join omop.person p on p.person_id = c.subject_id
+	left outer join omop.concept c_gender on c_gender.concept_id = p.gender_concept_id 
+	left outer join omop.concept c_race on c_race.concept_id = p.race_concept_id 
+	left outer join omop.concept c_ethnicity on c_ethnicity.concept_id = p.ethnicity_concept_id 
+where 
+	cohort_definition_id  = 23
+```
+
+Prompt: Join Person across sub-schemas (OMOP+ and FHIR+) and retrieve external identifiers
+```sql
+SELECT
+p.person_uuid,
+p.person_id,
+fhir_pt.id AS fhir_patient_id,
+identifiers.value::varchar AS identifier,
+identifiers."system"::varchar AS identifier_system
+FROM
+omop.person p,
+fhir.patient fhir_pt,
+fhir_pt.identifier identifiers
+WHERE p.person_uuid = fhir_pt.person_uuid
+LIMIT 10;
+```
+
+Prompt: Find all Conditions for a patient with MRN = 'PERSON_UUID' in OMOP
+```sql
+SELECT p.person_id,
+co.condition_occurrence_id, co.condition_start_datetime, co.condition_source_value
+FROM omop.condition_occurrence co
+JOIN omop.person p ON p.person_id = co.person_id
+WHERE p.person_uuid = 'PERSON_UUID';
+```
+
+Prompt: Find all Conditions in FHIR and their corresponding OMOP Condition Occurrence records
+```sql
+SELECT fhir_resource.id, fhir_resource.code, fhir_resource.category, fhir_resource.severity, fhir_resource.onsetdatetime,
+omop_table.condition_occurrence_id, omop_table.condition_start_datetime, omop_table.condition_source_value,
+c.concept_name, c.concept_code, c.vocabulary_id
+FROM fhir.condition fhir_resource,
+omop.condition_occurrence omop_table,
+omop.concept c
+WHERE omop_table.person_uuid = fhir_resource.person_uuid
+AND omop_table.resource_type = 'Condition'
+AND omop_table.resource_id = fhir_resource.id
+AND omop_table.condition_concept_id = c.concept_id
+LIMIT 10;
+```
+Prompt: Find all Drug Exposures in FHIR and their corresponding OMOP Drug Exposure records
+```sql
+-- Complex query to join DRUG_EXPOSURE with multiple FHIR medication resource types
+-- Demonstrates how a single OMOP table can be sourced from multiple FHIR resource types
+SELECT
+-- Output which resource type was matched
+CASE
+WHEN md.id IS NOT NULL THEN 'MedicationDispense'
+WHEN m.id IS NOT NULL THEN 'Medication'
+WHEN ms.id IS NOT NULL THEN 'MedicationStatement'
+WHEN mr.id IS NOT NULL THEN 'MedicationRequest'
+WHEN ma.id IS NOT NULL THEN 'MedicationAdministration'
+WHEN i.id IS NOT NULL THEN 'Immunization'
+ELSE NULL
+END AS matched_fhir_resource,
+omop_table.*,
+-- Common fields across all 6 tables
+COALESCE(md.id, m.id, ms.id, mr.id, ma.id, i.id) AS id,
+COALESCE(md.status, m.status, ms.status, mr.status, ma.status, i.status) AS status,
+-- Common fields in 4 tables (medication* tables only)
+COALESCE(md.category, ms.category, mr.category, ma.category) AS category,
+-- Subject/Patient field (different naming in Immunization)
+COALESCE(md.subject, ms.subject, mr.subject, ma.subject) AS subject,
+i.patient,
+-- Medication reference fields
+COALESCE(md.medicationcodeableconcept, ms.medicationcodeableconcept,
+mr.medicationcodeableconcept, ma.medicationcodeableconcept) AS medicationcodeableconcept,
+COALESCE(md.medicationreference, ms.medicationreference,
+mr.medicationreference, ma.medicationreference) AS medicationreference,
+-- Performers across tables
+COALESCE(md.performer, mr.performer, ma.performer, i.performer) AS performer,
+-- Reason codes and references
+COALESCE(ms.reasoncode, mr.reasoncode, ma.reasoncode, i.reasoncode) AS reasoncode,
+COALESCE(ms.reasonreference, mr.reasonreference, ma.reasonreference, i.reasonreference) AS reasonreference,
+-- Status reason
+COALESCE(ms.statusreason, mr.statusreason, ma.statusreason, i.statusreason) AS statusreason,
+-- Keep original datetime fields separately to match source table names
+ma.effectivedatetime,
+ms.effectivedatetime AS statement_effectivedatetime,
+mr.authoredon,
+md.whenhandedover,
+i.occurrencedatetime,
+-- Context/Encounter
+COALESCE(ma.context, md.context, ms.context) AS context,
+COALESCE(mr.encounter, i.encounter) AS encounter,
+-- Notes
+COALESCE(md.note, ms.note, mr.note, ma.note, i.note) AS note,
+-- Dosage information - keep separate to match source names
+ma.dosage,
+ms.dosage AS statement_dosage,
+md.dosageinstruction,
+mr.dosageinstruction AS request_dosageinstruction,
+-- Location
+COALESCE(md.location, i.location) AS location,
+-- Resource type specific fields - keeping original names
+-- Immunization specific
+i.lotnumber,
+i.expirationdate,
+i.vaccineCode,
+-- Medication specific
+m.code,
+m.form,
+-- MedicationRequest specific
+mr.intent,
+mr.priority,
+-- MedicationDispense specific
+md.quantity,
+md.dayssupply
+FROM omop.drug_exposure omop_table
+LEFT OUTER JOIN fhir.medicationdispense md
+ON omop_table.resource_id = md.id
+AND omop_table.resource_type = 'MedicationDispense'
+LEFT OUTER JOIN fhir.medication m
+ON omop_table.resource_id = m.id
+AND omop_table.resource_type = 'Medication'
+LEFT OUTER JOIN fhir.medicationstatement ms
+ON omop_table.resource_id = ms.id
+AND omop_table.resource_type = 'MedicationStatement'
+LEFT OUTER JOIN fhir.medicationrequest mr
+ON omop_table.resource_id = mr.id
+AND omop_table.resource_type = 'MedicationRequest'
+LEFT OUTER JOIN fhir.medicationadministration ma
+ON omop_table.resource_id = ma.id
+AND omop_table.resource_type = 'MedicationAdministration'
+LEFT OUTER JOIN fhir.immunization i
+ON omop_table.resource_id = i.id
+AND omop_table.resource_type = 'Immunization'
+LIMIT 10;
+```
+
+Prompt: Query for lab results and vitals from OMOP MEASUREMENT table
+```sql
+SELECT
+CASE WHEN m.measurement_concept_id = 0 THEN m.measurement_source_value ELSE measure.concept_name END as measure,
+type.concept_name as source_type,
+CASE WHEN m.value_as_number IS NOT NULL THEN m.value_as_number::varchar ELSE value.concept_name END as value,
+CASE WHEN m.unit_concept_id = 0 THEN m.unit_source_value ELSE units.concept_name END as units,
+m.id
+FROM omop.measurement m
+LEFT JOIN omop.concept measure ON m.measurement_concept_id = measure.concept_id
+LEFT JOIN omop.concept type ON m.measurement_type_concept_id = type.concept_id
+LEFT JOIN omop.concept units ON m.unit_concept_id = units.concept_id
+LEFT JOIN omop.concept value ON m.value_as_concept_id = value.concept_id
+JOIN omop.concept_set_item cs_item ON m.measurement_concept_id = cs_item.concept_id
+AND cs_item.include_descendants = TRUE AND cs_item.include_mapped = TRUE
+JOIN omop.concept_set cs ON cs_item.concept_set_id = cs.concept_set_id
+AND cs.concept_set_name in ('CONCEPT_SET_1','CONCEPT_SET_2');
+```
